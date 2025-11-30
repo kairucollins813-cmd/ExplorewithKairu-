@@ -1,0 +1,539 @@
+import React, { useState, useEffect, useMemo } from 'react';
+// Firebase Imports: Using standard package paths for the React environment
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, addDoc, onSnapshot, collection, query, serverTimestamp, updateDoc, increment, getDoc, runTransaction, where, limit, orderBy } from 'firebase/firestore';
+
+// --- Configuration and Utilities ---
+
+// !!! KAIRU'S CREATOR ID !!!
+// IMPORTANT: Replace this placeholder with the actual User ID you see when you run the app and want to be the administrator.
+const CREATOR_ID = "kairu_creator_placeholder"; 
+
+// List of potential wildlife aliases for users
+const ALIASES = [
+    "Rhino", "Leopard", "Acacia", "Savannah", "Kudu", "Cheetah", "Zebra", "Gazelle", 
+    "Lion", "Elephant", "Buffalo", "Warthog", "Hyena", "Vulture", "Egret", "Ostrich"
+];
+
+// Global Firebase configuration variables (provided by the environment)
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Utility function to format timestamp
+const formatTimestamp = (timestamp) => {
+    if (!timestamp) return 'Just now';
+    if (timestamp.toDate) {
+        // Formats as M/D/YYYY, H:MM:SS AM/PM
+        return timestamp.toDate().toLocaleString(); 
+    }
+    return new Date(timestamp).toLocaleString();
+};
+
+// --- Component for Comment Display and Tagging ---
+
+// Function to parse text for links, hashtags, and mentions (@organizations/clients)
+const formatCommentText = (text) => {
+    const parts = text.split(/(\s+)/);
+    return parts.map((part, index) => {
+        // Check for standard URL
+        if (part.startsWith('http://') || part.startsWith('https://')) {
+            return <a key={index} href={part} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">{part}</a>;
+        }
+        // Check for mention/organization tag (@)
+        if (part.startsWith('@')) {
+            const tag = part.substring(1);
+            return <span key={index} className="text-indigo-700 font-semibold bg-indigo-50 rounded px-1.5 py-0.5 whitespace-nowrap">@{tag}</span>;
+        }
+        // Check for generic hashtag
+        if (part.startsWith('#')) {
+            return <span key={index} className="text-emerald-700 font-semibold bg-emerald-50 rounded px-1.5 py-0.5 whitespace-nowrap">{part}</span>;
+        }
+        return part;
+    });
+};
+
+const CommentItem = ({ comment, userId, handleUpvote }) => {
+    const hasUpvoted = comment.upvoters.includes(userId);
+    const upvoteIconClass = hasUpvoted ? 'text-red-500 fill-current' : 'text-gray-400 hover:text-red-500';
+
+    return (
+        <div className="p-4 bg-white border border-gray-200 rounded-lg shadow-sm flex justify-between items-start">
+            
+            {/* Comment Content */}
+            <div className="flex-grow pr-4">
+                <p className="text-gray-800 mb-2 leading-snug break-words">
+                    {formatCommentText(comment.text)}
+                </p>
+                <div className="text-xs text-gray-400">
+                    <span className={`font-bold ${comment.commenterId === userId ? 'text-emerald-600' : 'text-gray-600'} ${comment.alias.includes('Kairu') ? 'text-yellow-700' : ''}`}>
+                        {comment.alias}
+                    </span> 
+                    <span className="ml-2">| {formatTimestamp(comment.timestamp)}</span>
+                </div>
+            </div>
+
+            {/* Upvote Button */}
+            <div className="flex flex-col items-center flex-shrink-0">
+                <button 
+                    onClick={() => handleUpvote(comment.id, hasUpvoted)}
+                    // Users cannot upvote their own comments
+                    disabled={!userId || comment.commenterId === userId} 
+                    className={`transition-colors duration-150 p-1 rounded-full ${!userId || comment.commenterId === userId ? 'cursor-not-allowed' : 'hover:bg-gray-100'}`}
+                    title={!userId ? "Sign in to upvote" : hasUpvoted ? "Retract Like" : "Like"}
+                >
+                    <svg className={`w-5 h-5 ${upvoteIconClass}`} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                        <path fillRule="evenodd" d="M3.172 5.172a4 4 0 015.656 0L10 6.343l1.172-1.171a4 4 0 115.656 5.656L10 17.657l-6.828-6.829a4 4 0 010-5.656z" clipRule="evenodd" />
+                    </svg>
+                </button>
+                <span className={`text-sm font-semibold mt-1 ${hasUpvoted ? 'text-red-500' : 'text-gray-600'}`}>
+                    {comment.upvotes}
+                </span>
+            </div>
+        </div>
+    );
+};
+
+// --- Main Application Component ---
+const App = () => {
+    const [db, setDb] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [userAlias, setUserAlias] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [activeStory, setActiveStory] = useState(null); 
+    const [comments, setComments] = useState([]);
+    const [newCommentText, setNewCommentText] = useState('');
+    const [error, setError] = useState(null);
+    
+    // Check if the current user is Kairu (The Creator)
+    const isCreator = useMemo(() => userId === CREATOR_ID, [userId]); 
+
+    // State for Creator Mode
+    const [newStory, setNewStory] = useState({ title: '', content: '', imageUrl: '' });
+    const [showCreatorModal, setShowCreatorModal] = useState(false);
+
+    // 1. Firebase Initialization and Authentication
+    useEffect(() => {
+        try {
+            const app = initializeApp(firebaseConfig);
+            const firestore = getFirestore(app);
+            const firebaseAuth = getAuth(app);
+            
+            setDb(firestore);
+
+            // Handle authentication state changes
+            const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+                if (user) {
+                    setUserId(user.uid);
+                    await initializeUserAlias(firestore, user.uid, user.uid === CREATOR_ID);
+                } else if (!user && !initialAuthToken) {
+                    // Sign in anonymously if no token is provided
+                    await signInAnonymously(firebaseAuth);
+                } else if (initialAuthToken) {
+                    // Sign in with provided custom token
+                    await signInWithCustomToken(firebaseAuth, initialAuthToken);
+                }
+                setIsAuthReady(true);
+            });
+
+            // Set debug logging for Firestore
+            if (firestore.setLogLevel) {
+                firestore.setLogLevel('debug');
+            }
+
+            return () => unsubscribe();
+
+        } catch (e) {
+            console.error("Firebase Initialization Error:", e);
+            setError("Failed to initialize Firebase services.");
+        }
+    }, []);
+
+    // Function to assign a persistent wildlife alias to the user
+    const initializeUserAlias = async (firestore, uid, isKairu) => {
+        if (isKairu) {
+            setUserAlias("Kairu (The Guide)");
+            return;
+        }
+
+        const userDocPath = `/artifacts/${appId}/users/${uid}/metadata/profile`;
+        const userRef = doc(firestore, userDocPath);
+        
+        try {
+            const docSnap = await getDoc(userRef);
+            if (docSnap.exists() && docSnap.data().alias) {
+                setUserAlias(docSnap.data().alias);
+            } else {
+                // Assign a new random alias if none exists
+                const newAlias = ALIASES[Math.floor(Math.random() * ALIASES.length)];
+                await setDoc(userRef, { alias: `Explorer ${newAlias}`, userId: uid }, { merge: true });
+                setUserAlias(`Explorer ${newAlias}`);
+            }
+        } catch (e) {
+            console.error("Error setting/getting user alias:", e);
+            setUserAlias(`Explorer ${uid.substring(0, 8)}`);
+        }
+    };
+    
+    // 2. Fetch Active Story (The Latest Post)
+    useEffect(() => {
+        // Do not proceed until Firebase and Auth are ready
+        if (!db || !isAuthReady) return;
+
+        const storiesCollectionPath = `/artifacts/${appId}/public/data/kairu_stories_content`;
+        const storiesRef = collection(db, storiesCollectionPath);
+        
+        // Query for the single latest story based on timestamp
+        const q = query(storiesRef, orderBy('timestamp', 'desc'), limit(1));
+
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            if (snapshot.docs.length > 0) {
+                setActiveStory({ id: snapshot.docs[0].id, ...snapshot.docs[0].data() });
+            } else {
+                // Load default story if no content exists in the database
+                setActiveStory({
+                    id: 'default_01',
+                    title: "The Gentle Giant: My Unforgettable Encounter with a Maasai Giraffe",
+                    content: "This is the first post. When you spend time in the wild, you learn that every animal has a distinct personality. Watching her browse high up in the acacia trees felt like observing a natural monument. Giraffes are critical to savanna ecology, but their numbers are threatened by habitat loss. Let's discuss conservation. Use @OrganizationName to tag a group you support!",
+                    imageUrl: "https://placehold.co/800x400/f59e0b/ffffff?text=Majestic+Giraffe+in+Acacia+Tree",
+                    tags: ["Giraffe", "Savanna Ecology", "Conservation", "Maasai"],
+                    author: "Kairu (The Guide)", 
+                    timestamp: new Date(),
+                });
+            }
+        }, (err) => {
+            console.error("Firestore Story Snapshot Error:", err);
+            setError("Failed to load stories.");
+        });
+
+        return () => unsubscribe();
+    }, [db, isAuthReady]);
+
+
+    // 3. Real-time Comment Listener (Triggered when activeStory changes)
+    useEffect(() => {
+        // Guard against running queries before auth is ready or if no story is active
+        if (!db || !isAuthReady || !userId || !activeStory || activeStory.id === 'default_01') {
+            setComments([]);
+            return;
+        }
+
+        const commentsCollectionPath = `/artifacts/${appId}/public/data/kairu_story_comments`;
+        const commentsRef = collection(db, commentsCollectionPath);
+        
+        // Filter comments only for the currently active story
+        const q = query(commentsRef, where('storyId', '==', activeStory.id));
+
+        const unsubscribe = onSnapshot(q, async (snapshot) => {
+            const fetchedComments = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data(),
+                commenterId: doc.data().userId, 
+                upvotes: doc.data().upvotes || 0,
+                upvoters: doc.data().upvoters || [],
+            }));
+
+            // Asynchronously fetch aliases for all commenters
+            const commentsWithAliases = await Promise.all(fetchedComments.map(async (comment) => {
+                let alias = `Explorer ${comment.commenterId.substring(0, 8)}`; 
+
+                if (comment.commenterId === CREATOR_ID) {
+                    alias = "Kairu (The Guide)";
+                } else {
+                    const userDocPath = `/artifacts/${appId}/users/${comment.commenterId}/metadata/profile`;
+                    const userRef = doc(db, userDocPath);
+                    const userSnap = await getDoc(userRef);
+                    if (userSnap.exists() && userSnap.data().alias) {
+                        alias = userSnap.data().alias; 
+                    }
+                }
+                return { ...comment, alias: alias };
+            }));
+
+            // Sort by upvotes (highest first), then by newest timestamp (if upvotes are equal)
+            commentsWithAliases.sort((a, b) => {
+                if (b.upvotes !== a.upvotes) return b.upvotes - a.upvotes;
+                if (a.timestamp && b.timestamp) return b.timestamp.toDate() - a.timestamp.toDate();
+                return 0;
+            });
+            
+            setComments(commentsWithAliases);
+        }, (err) => {
+            console.error("Firestore Comments Snapshot Error:", err);
+            setError("Failed to load comments in real-time.");
+        });
+
+        return () => unsubscribe();
+    }, [db, isAuthReady, userId, activeStory]);
+    
+    // Function to handle posting a new comment
+    const handlePostComment = async () => {
+        if (!newCommentText.trim() || !db || !userId || !activeStory || activeStory.id === 'default_01') return;
+
+        const safeCommentText = newCommentText.trim();
+        const commentsCollectionPath = `/artifacts/${appId}/public/data/kairu_story_comments`;
+
+        try {
+            await addDoc(collection(db, commentsCollectionPath), {
+                text: safeCommentText,
+                userId: userId, 
+                storyId: activeStory.id, 
+                timestamp: serverTimestamp(),
+                upvotes: 0,
+                upvoters: [], // Array to track users who have upvoted
+            });
+            setNewCommentText('');
+        } catch (e) {
+            console.error("Error adding document: ", e);
+            setError("Error posting comment. Check console for details.");
+        }
+    };
+
+    // Function to handle the upvote transaction 
+    const handleUpvote = async (commentId, isUpvoted) => {
+        if (!db || !userId) return;
+
+        const commentRef = doc(db, `/artifacts/${appId}/public/data/kairu_story_comments/${commentId}`);
+
+        try {
+            // Use a transaction to ensure atomic read/write for consistent upvote count
+            await runTransaction(db, async (transaction) => {
+                const docSnap = await transaction.get(commentRef);
+                if (!docSnap.exists()) {
+                    throw new Error("Comment does not exist!");
+                }
+
+                const currentUpvoters = docSnap.data().upvoters || [];
+                let newUpvoters = [...currentUpvoters];
+                let upvoteChange = 0;
+
+                if (isUpvoted) {
+                    // User is retracting their upvote
+                    newUpvoters = newUpvoters.filter(id => id !== userId);
+                    upvoteChange = -1;
+                } else if (!currentUpvoters.includes(userId)) {
+                    // User is adding an upvote
+                    newUpvoters.push(userId);
+                    upvoteChange = 1;
+                } else {
+                    // Should not happen if UI is correct, but guards against double-upvote logic fail
+                    return; 
+                }
+
+                transaction.update(commentRef, {
+                    upvotes: increment(upvoteChange),
+                    upvoters: newUpvoters,
+                });
+            });
+        } catch (e) {
+            console.error("Upvote failed:", e);
+            // Check for custom errors or default message
+            if (e.message !== "Comment does not exist!") {
+                 setError("Failed to process upvote. Check console.");
+            }
+        }
+    };
+
+    // --- Content Creator Functions (Only for Kairu) ---
+    const handleNewStoryChange = (e) => {
+        const { name, value } = e.target;
+        setNewStory(prev => ({ ...prev, [name]: value }));
+    };
+
+    const handlePostStory = async () => {
+        if (!newStory.title.trim() || !newStory.content.trim() || !db) return;
+
+        const storiesCollectionPath = `/artifacts/${appId}/public/data/kairu_stories_content`;
+
+        try {
+            await addDoc(collection(db, storiesCollectionPath), {
+                title: newStory.title.trim(),
+                content: newStory.content.trim(),
+                imageUrl: newStory.imageUrl.trim() || 'https://placehold.co/800x400/10b981/ffffff?text=ExplorewithKairu+Post',
+                // Basic tag extraction from content (words starting with #)
+                tags: newStory.content.trim().split(/\s+/).filter(word => word.startsWith('#')).map(tag => tag.substring(1)),
+                author: "Kairu (The Guide)",
+                timestamp: serverTimestamp(),
+            });
+            setNewStory({ title: '', content: '', imageUrl: '' });
+            setShowCreatorModal(false);
+            setError(null);
+        } catch (e) {
+            console.error("Error posting new story: ", e);
+            setError("Error posting new story. Please try again.");
+        }
+    };
+    // --- End Creator Functions ---
+
+
+    // Component Rendering
+    return (
+        <div className="min-h-screen bg-gray-50 p-4 sm:p-8 font-sans">
+            <header className="text-center mb-8">
+                <h1 className="text-4xl font-extrabold text-emerald-700">Explore with Kairu</h1>
+                <p className="text-lg text-gray-700 font-medium">The Official Wildlife Family Hub</p>
+                <div className="text-sm mt-3 text-gray-600 border-t border-gray-200 pt-2">
+                    Welcome, 
+                    <span className={`font-semibold ml-1 ${isCreator ? 'text-yellow-600' : 'text-emerald-600'}`}>
+                        {userAlias || 'Guest Explorer'}
+                    </span>! 
+                    Your User ID: 
+                    <span className="font-mono bg-yellow-100 p-1 rounded-md text-xs">{userId || 'Signing in...'}</span>
+                    
+                    {/* Kairu's Creator Button - Only visible to the designated CREATOR_ID */}
+                    {isCreator && (
+                        <button 
+                            onClick={() => setShowCreatorModal(true)}
+                            className="ml-4 px-3 py-1 bg-yellow-600 text-white text-xs font-bold rounded-full hover:bg-yellow-700 transition-colors shadow-md"
+                        >
+                            + New Story (Creator Mode)
+                        </button>
+                    )}
+                </div>
+                {error && <p className="text-red-500 mt-2 p-2 bg-red-100 rounded-lg">{error}</p>}
+            </header>
+
+            <main className="max-w-4xl mx-auto">
+                {/* Main Story Post Card - Displays the latest post */}
+                {activeStory ? (
+                    <div className="bg-white rounded-xl shadow-2xl overflow-hidden mb-8 ring-4 ring-yellow-200 ring-opacity-50">
+                        <img 
+                            src={activeStory.imageUrl} 
+                            alt={activeStory.title} 
+                            className="w-full h-48 object-cover object-center"
+                            onError={(e) => { e.target.onerror = null; e.target.src = "https://placehold.co/800x400/4c4c4c/ffffff?text=Image+Not+Available"; }}
+                        />
+                        <div className="p-5 sm:p-6">
+                            <h2 className="text-3xl font-bold text-gray-900 mb-2">{activeStory.title}</h2>
+                            <p className="text-sm text-gray-500 mb-4">
+                                By 
+                                <span className={`font-bold ml-1 ${activeStory.author === "Kairu (The Guide)" ? 'text-yellow-700' : 'text-gray-500'}`}>
+                                    {activeStory.author} 
+                                </span> 
+                                | {formatTimestamp(activeStory.timestamp)}
+                            </p>
+                            <p className="text-gray-700 leading-relaxed mb-4 whitespace-pre-wrap">{activeStory.content}</p>
+                            <div className="flex flex-wrap gap-2">
+                                {(activeStory.tags || []).map(tag => (
+                                    <span key={tag} className="text-xs font-semibold px-3 py-1 bg-yellow-100 text-yellow-700 rounded-full">
+                                        #{tag}
+                                    </span>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                ) : (
+                    <div className="text-center p-10 bg-white rounded-xl shadow-lg">
+                        <p className="text-gray-500">Loading the latest exploration...</p>
+                        <div className="animate-spin h-6 w-6 border-4 border-emerald-500 border-t-transparent rounded-full mx-auto mt-4"></div>
+                    </div>
+                )}
+                
+
+                {/* Comment Section */}
+                {activeStory && (
+                    <div className="bg-white rounded-xl shadow-lg p-5 sm:p-6">
+                        <h3 className="text-2xl font-bold text-gray-800 border-b pb-3 mb-4">Join the Family ({comments.length} Voices)</h3>
+
+                        {/* New Comment Input */}
+                        <div className="mb-6 p-4 bg-gray-50 rounded-lg border border-gray-200">
+                            <textarea
+                                className="w-full p-3 border-none rounded-lg focus:ring-emerald-500 focus:ring-2 resize-none transition-all duration-200"
+                                rows="3"
+                                placeholder={userAlias ? `Hello ${userAlias}, share your thoughts and mention groups like @WWF or #Conservation...` : "Signing in... please wait to comment."}
+                                value={newCommentText}
+                                onChange={(e) => setNewCommentText(e.target.value)}
+                                disabled={!userId || !isAuthReady || !activeStory || activeStory.id === 'default_01'}
+                            />
+                            <button
+                                onClick={handlePostComment}
+                                className={`w-full py-2 mt-2 font-semibold rounded-lg transition-all duration-300 ${
+                                    (newCommentText.trim() && userId && activeStory.id !== 'default_01')
+                                        ? 'bg-emerald-600 text-white hover:bg-emerald-700 shadow-md'
+                                        : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                                }`}
+                                disabled={!newCommentText.trim() || !userId || activeStory.id === 'default_01'}
+                            >
+                                Post Comment
+                            </button>
+                            {activeStory.id === 'default_01' && <p className="text-xs text-red-500 mt-2">Post your first story in Creator Mode to enable comments.</p>}
+                        </div>
+
+                        {/* Comments List */}
+                        <div className="space-y-4">
+                            {comments.length === 0 && (
+                                <p className="text-gray-500 italic text-center py-4">No comments yet. Be the first to join the family!</p>
+                            )}
+                            {comments.map((comment) => (
+                                <CommentItem 
+                                    key={comment.id}
+                                    comment={comment}
+                                    userId={userId}
+                                    handleUpvote={handleUpvote}
+                                />
+                            ))}
+                        </div>
+                    </div>
+                )}
+            </main>
+            
+            {/* Creator Modal (Only for Kairu) */}
+            {showCreatorModal && (
+                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+                    <div className="bg-white rounded-xl p-6 w-full max-w-lg shadow-2xl">
+                        <h3 className="text-2xl font-bold mb-4 text-emerald-700">Post a New Story</h3>
+                        
+                        <input
+                            type="text"
+                            name="title"
+                            placeholder="Story Title (e.g., The Gentle Giant)"
+                            value={newStory.title}
+                            onChange={handleNewStoryChange}
+                            className="w-full p-3 mb-3 border border-gray-300 rounded-lg focus:ring-emerald-500 focus:border-emerald-500"
+                        />
+                         <input
+                            type="text"
+                            name="imageUrl"
+                            placeholder="Image URL (e.g., https://placehold.co/800x400/...)"
+                            value={newStory.imageUrl}
+                            onChange={handleNewStoryChange}
+                            className="w-full p-3 mb-3 border border-gray-300 rounded-lg focus:ring-emerald-500 focus:border-emerald-500"
+                        />
+                        <textarea
+                            name="content"
+                            rows="5"
+                            placeholder="Your story content here. Use hashtags like #Giraffe and mention groups like @OrganizationName"
+                            value={newStory.content}
+                            onChange={handleNewStoryChange}
+                            className="w-full p-3 mb-4 border border-gray-300 rounded-lg focus:ring-emerald-500 focus:border-emerald-500 resize-none"
+                        />
+                        
+                        <div className="flex justify-end space-x-3">
+                            <button
+                                onClick={() => setShowCreatorModal(false)}
+                                className="px-4 py-2 text-gray-700 bg-gray-200 rounded-lg hover:bg-gray-300 transition-colors"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={handlePostStory}
+                                disabled={!newStory.title.trim() || !newStory.content.trim()}
+                                className={`px-4 py-2 text-white font-semibold rounded-lg transition-colors ${
+                                    newStory.title.trim() && newStory.content.trim() 
+                                        ? 'bg-emerald-600 hover:bg-emerald-700' 
+                                        : 'bg-gray-400 cursor-not-allowed'
+                                }`}
+                            >
+                                Publish Story
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+};
+
+export default App;
+
